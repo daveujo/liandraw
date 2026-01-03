@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name        Lichess Funnies v35.2 (Dynamic Panic + 7.5s Blunder Mode + SPA-safe) andraw clean
-// @version     36.2
+// @name        Lichess Funnies v35.2 (Dynamic Panic + 7.5s Blunder Mode + SPA-safe) andraw clean fix
+// @version     36.3
 // @description Chess for disabled people experimental all features of automove through websockets and stockfish is temp will be retracted after prelims tests (Instant Move + Arrow Toggle + MultiPV Attacking Hints w/ Legends; auto-refresh arrows on your turn)
 // @author      Michael and Ian (modified with Config Toggles)
 // @match       https://lichess.org/*
@@ -9,6 +9,7 @@
 // @run-at      document-start
 // @updateURL   https://github.com/mchappychen/lichess-funnies/blob/main/lichess.user.js
 // @downloadURL https://github.com/mchappychen/lichess-funnies/blob/main/lichess.user.js
+// @require     https://raw.githubusercontent.com/workinworld/stkfish/main/stockfish8.js
 // @require     https://code.jquery.com/jquery-3.6.0.min.js
 // @require     https://raw.githubusercontent.com/mchappychen/lichess-funnies/main/chess.js
 // @require     https://raw.githubusercontent.com/mchappychen/lichess-funnies/main/stockfish.js
@@ -17,6 +18,48 @@
 
 // NOTE: Lichess is a single-page app (SPA). Games often start without a full page reload,
 // so we must NOT exit early on the homepage. We simply wait for game DOM nodes to appear.
+
+// --- PANIC ENGINE (chess_engine.js alternative) ---
+let panicEngine = null;
+let panicEngineReady = false;
+let panicCurrentFen = "";
+let panicBestMove = null;
+
+function initializePanicEngine() {
+  if (panicEngine) return;
+  panicEngine = window.STOCKFISH();
+  panicEngine.onmessage = function(event) {
+    if (event && typeof event === 'string' && event.includes("bestmove")) {
+      panicBestMove = event.split(" ")[1];
+      // Execute move immediately when in panic mode
+      if (panicBestMove && webSocketWrapper && webSocketWrapper.readyState === 1) {
+        const clockSecs = getClockSeconds();
+        if (clockSecs < panicThreshold) {
+          console.log(`[⚡ PANIC ENGINE] Sending:  ${panicBestMove} | Clock: ${clockSecs.toFixed(1)}s`);
+          webSocketWrapper.send(JSON.stringify({
+            t: "move",
+            d: { u: panicBestMove, a: 1, b: 100, l: 1000 }  //tweaked b=100(1)
+          }));
+          pendingMove = false;
+          isProcessing = false;
+        }
+      }
+    }
+  };
+  panicEngineReady = true;
+  console.log('[Panic Engine] ✅ Initialized');
+}
+
+function panicCalculateMove(fen) {
+  if (!panicEngine || !panicEngineReady) {
+    initializePanicEngine();
+    setTimeout(() => panicCalculateMove(fen), 50);
+    return;
+  }
+  panicCurrentFen = fen;
+  panicEngine.postMessage("position fen " + fen);
+  panicEngine.postMessage("go depth 2");
+}
 
 // --- socket wrapper ---
 let webSocketWrapper = null;
@@ -30,6 +73,25 @@ const webSocketProxy = new Proxy(window.WebSocket, {
         let msg = JSON.parse(event.data);
         if (msg.t === 'move' && msg.d && typeof msg.d.ply !== 'undefined') {
           currentAck = msg.d.ply;
+        }
+        // Intercept FEN for panic engine (chess_engine.js style)
+        if (msg.d && typeof msg.d.fen === "string" && typeof msg.v === "number") {
+          const clockSecs = getClockSeconds();
+          if (clockSecs < panicThreshold && autoHint) {
+            let interceptedFen = msg.d.fen;
+            let isWhitesTurn = msg.v % 2 == 0;
+            interceptedFen += isWhitesTurn ? " w" : " b";
+            // Check if it's our turn before calculating
+            const cgWrap = $('.cg-wrap')[0];
+            if (cgWrap) {
+              const myCol = cgWrap.classList.contains('orientation-white') ? 'w' : 'b';
+              const turnChar = isWhitesTurn ? 'w' : 'b';
+              if (myCol === turnChar) {
+                console.log(`[⚡ PANIC INTERCEPT] FEN detected, using panic engine`);
+                panicCalculateMove(interceptedFen);
+              }
+            }
+          }
         }
       } catch (e) {}
     });
@@ -81,7 +143,7 @@ const PRESETS = {
   '15s': {
     engineMs: 20,
     varied: {
-      maxCpLoss: 300,           // Normal safety
+      maxCpLoss: 300,            // Normal safety
       weights: [10, 45, 23, 22],
       maxBlundersPerGame: 10,
       blunderThreshold: 100,
@@ -107,7 +169,7 @@ const PRESETS = {
   '30s': {
     engineMs: 60,
     varied: {
-      maxCpLoss: 200,           // Strict safety
+      maxCpLoss: 200,            // Strict safety
       weights: [30, 55, 10, 5],
       maxBlundersPerGame: 5,
       blunderThreshold: 100,
@@ -162,7 +224,7 @@ let lastMoveSent = null;
 let lastMoveSentTime = 0;
 
 // Dynamic Panic Threshold (Defaults to 1.5, changes per turn)
-let panicThreshold = 1.5;
+let panicThreshold = 2;
 
 // --- Helpers ---
 function waitForElement(sel) {
@@ -199,7 +261,7 @@ function getClockSeconds() {
   }
 
   const text = clockEl.textContent || '';
-  const match = text.match(/(\d+):(\d+)(?:\.(\d))?/);
+  const match = text.match(/(\d+):(\d+)(?:.(\d))?/);
   if (!match) {
     return 999;
   }
@@ -353,7 +415,7 @@ function selectVariedMove(pvs) {
   let allowBlunder = false;
   if (gameBlunderCount < cfg.maxBlundersPerGame && topEval > -100 && Math.random() < cfg.blunderChance) {
     allowBlunder = true;
-    console.log('[Vary] 🎲 Blunder allowed!');
+    console.log('[Vary] 🎲 Blunder allowed! ');
   }
 
   const candidates = [];
@@ -546,9 +608,19 @@ function parseInfoLine(text) {
   };
 }
 
-// MODIFIED FOR VARIABLE PANIC MODE
+// MODIFIED FOR VARIABLE PANIC MODE - Now bypasses to panic engine
 function getMultiPV(fen, retryCount = 0) {
   return new Promise((resolve) => {
+    // CHECK FOR PANIC MODE - bypass to faster engine
+    const clockSecs = getClockSeconds();
+    if (clockSecs < panicThreshold) {
+      console.log(`[⚡ PANIC BYPASS] Clock: ${clockSecs.toFixed(1)}s - Using panic engine instead`);
+      // Trigger panic engine and resolve with empty (panic engine handles move execution)
+      panicCalculateMove(fen);
+      resolve([]);
+      return;
+    }
+
     if (!engineReady) {
       setTimeout(() => getMultiPV(fen, retryCount).then(resolve), 100);
       return;
@@ -557,10 +629,7 @@ function getMultiPV(fen, retryCount = 0) {
     const pvs = new Map();
     let resolved = false;
 
-    // Check for low time (Variable threshold)
-    const clockSecs = getClockSeconds();
-    const isLowTime = clockSecs < panicThreshold;
-    const engineTime = isLowTime ? 1 : activeEngineMs;
+    const engineTime = activeEngineMs;
 
     const handler = (e) => {
       if (resolved) return;
@@ -589,7 +658,7 @@ function getMultiPV(fen, retryCount = 0) {
       }
     };
 
-    // Failsafe: If engine hangs for more than 400ms in low time, resolve anyway
+    // Failsafe timeout
     setTimeout(() => {
       if (!resolved) {
         resolved = true;
@@ -599,18 +668,12 @@ function getMultiPV(fen, retryCount = 0) {
         cachedPVsFen = fen;
         resolve(arr);
       }
-    }, isLowTime ? 400 : 2000);
+    }, 2000);
 
     sfListeners.add(handler);
     stockfish.postMessage('stop');
     stockfish.postMessage('position fen ' + fen);
-
-    if (isLowTime) {
-        // PANIC MODE: Depth 1 is instant. Movetime 1 still has overhead.
-        stockfish.postMessage('go depth 1');
-    } else {
-        stockfish.postMessage(`go movetime ${engineTime}`);
-    }
+    stockfish.postMessage(`go movetime ${engineTime}`);
   });
 }
 
@@ -695,7 +758,8 @@ function executeMove(uci) {
   lastMoveSentTime = now;
 
   console.log(`[Exec] ✅ Sending: ${uci}`);
-  webSocketWrapper.send(JSON.stringify({ t: "move", d: { u: uci, a: currentAck, b: 0, l: 10000 } }));
+  // tweaked b =100(0)
+  webSocketWrapper.send(JSON.stringify({ t: "move", d: { u: uci, a: currentAck, b: 1, l: 1000 } }));
   pendingMove = false;
   isProcessing = false;
   return true;
@@ -706,10 +770,10 @@ function executeMoveHumanized(uci, engineMs = 0) {
 
   const clockSecs = getClockSeconds();
 
-  // LOW TIME - EVERYTHING IS INSTANT (Uses variable threshold)
+  // LOW TIME - BYPASS TO PANIC ENGINE (chess_engine.js style)
   if (clockSecs < panicThreshold) {
-    console.log(`[⚡ LOW TIME] ${uci} | Clock: ${clockSecs.toFixed(1)}s (Panic: ${panicThreshold.toFixed(1)}s) - INSTANT`);
-    executeMove(uci);
+    console.log(`[⚡ LOW TIME] ${uci} | Clock: ${clockSecs.toFixed(1)}s (Panic: ${panicThreshold.toFixed(1)}s) - PANIC ENGINE ACTIVE`);
+    // Don't execute here - panic engine handles it via WebSocket intercept
     return;
   }
 
@@ -787,27 +851,28 @@ async function processTurn() {
   pendingMove = true;
 
   // NEW: Randomize Panic Threshold at start of turn (1.0 to 1.7s)
-  panicThreshold = 1.0 + Math.random() * 0.7;
+  panicThreshold = 1.6 + Math.random() * 0.7;
 
   const clockSecs = getClockSeconds();
   const currentFen = game.fen();
   const t0 = performance.now();
 
+  // PANIC MODE CHECK - bypass all freebie logic, use chess_engine.js style
+  if (clockSecs < panicThreshold) {
+    console.log(`[⚡ PANIC MODE] Clock: ${clockSecs.toFixed(1)}s - Bypassing freebie logic`);
+    panicCalculateMove(currentFen);
+    // Don't wait - panic engine will handle move execution
+    return;
+  }
+
   try {
     let pvs;
     let engineTime;
 
-    // LOW TIME MODE - use cached PVs ONLY if they match current position AND we are under panic threshold
-    if (clockSecs < panicThreshold && cachedPVs && cachedPVs.length > 0 && cachedPVsFen === currentFen) {
-      pvs = cachedPVs;
-      engineTime = 0;
-      console.log(`[Engine] ⚡ LOW TIME - using cached PVs (valid)`);
-    } else {
-      // Must compute - but use minimal time if low on clock
-      pvs = await getMultiPV(currentFen);
-      engineTime = Math.round(performance.now() - t0);
-      console.log(`[Engine] Clock: ${clockSecs.toFixed(1)}s | Took: ${engineTime}ms`);
-    }
+    // Normal mode - use full engine
+    pvs = await getMultiPV(currentFen);
+    engineTime = Math.round(performance.now() - t0);
+    console.log(`[Engine] Clock: ${clockSecs.toFixed(1)}s | Took: ${engineTime}ms`);
 
     if (!pvs || pvs.length === 0) {
       isProcessing = false;
@@ -876,9 +941,9 @@ function createBottomDock() {
   root.id = 'lf-bottom-dock';
   root.style.cssText = [
     'position: fixed',
-    'left:50%',
+    'left: 50%',
     'bottom:8px',
-    'transform:translateX(-50%)',
+    'transform: translateX(-50%)',
     'z-index:999999',
     'pointer-events:none'
   ].join(';');
@@ -891,8 +956,8 @@ function createBottomDock() {
     'gap:6px',
     'padding:6px 8px',
     'background: rgba(0,0,0,0.35)',
-    'border-radius:12px',
-    'backdrop-filter:blur(4px)',
+    'border-radius: 12px',
+    'backdrop-filter: blur(4px)',
     'max-width:calc(100vw - 16px)',
     'overflow-x:auto'
   ].join(';');
@@ -905,7 +970,7 @@ function createBottomDock() {
 
   const content = document.createElement('div');
   content.id = 'lf-bottom-dock-content';
-  content.style.cssText = 'display:flex;align-items:center;gap:6px;';
+  content.style.cssText = 'display:flex;align-items:center;gap: 6px;';
 
   bar.appendChild(toggle);
   bar.appendChild(content);
@@ -928,6 +993,10 @@ function createBottomDock() {
 // --- Main ---
 async function run() {
   console.log('[Init] Starting...');
+
+  // Initialize panic engine early
+  initializePanicEngine();
+
   await configureEngine();
   setupPieceSelectMode();
   syncGameState();
@@ -942,11 +1011,11 @@ async function run() {
   // In the MutationObserver callback (around line 470), add lastMoveSent reset:
   const moveObs = new MutationObserver((muts) => {
     for (const mut of muts) {
-      if (mut.addedNodes. length === 0) continue;
+      if (mut.addedNodes.length === 0) continue;
       if (mut.addedNodes[0].tagName === "I5Z") continue;
 
-      const lastEl = $('l4x')[0]?. lastChild;
-      if (! lastEl) continue;
+      const lastEl = $('l4x')[0]?.lastChild;
+      if (!lastEl) continue;
 
       try { game.move(lastEl.textContent); } catch (e) {}
 
